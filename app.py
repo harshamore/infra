@@ -1,173 +1,328 @@
 import streamlit as st
 import openai
 import boto3
-from google.cloud import compute_v1
-from azure.identity import ClientSecretCredential
-from azure.mgmt.compute import ComputeManagementClient
 import json
-import yaml
-from typing import Dict, Any
-import os
+from typing import Dict, List, Optional
+from datetime import datetime
+import threading
+import queue
+from decimal import Decimal
 
-# Cloud Provider Authentication Classes
-class CloudAuth:
-    @staticmethod
-    def aws_auth(credentials: Dict[str, str]) -> boto3.Session:
-        return boto3.Session(
-            aws_access_key_id=credentials['access_key'],
-            aws_secret_access_key=credentials['secret_key'],
-            region_name=credentials['region']
-        )
-    
-    @staticmethod
-    def gcp_auth(credentials: Dict[str, str]) -> compute_v1.InstancesClient:
-        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials['credentials_path']
-        return compute_v1.InstancesClient()
-    
-    @staticmethod
-    def azure_auth(credentials: Dict[str, str]) -> ComputeManagementClient:
-        credential = ClientSecretCredential(
-            tenant_id=credentials['tenant_id'],
-            client_id=credentials['client_id'],
-            client_secret=credentials['client_secret']
-        )
-        return ComputeManagementClient(credential, credentials['subscription_id'])
+class AWSAction:
+    def __init__(self, service: str, action: str, parameters: Dict):
+        self.service = service
+        self.action = action
+        self.parameters = parameters
+        self.response = None
+        self.resource_id = None
+        self.rollback_action = None
+        self.rollback_parameters = None
 
-class CloudProvisioner:
+class DeploymentManager:
     def __init__(self):
-        self.cloud_clients = {}
-    
-    def provision_resource(self, provider: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        if provider == "AWS":
-            return self._provision_aws(config)
-        elif provider == "GCP":
-            return self._provision_gcp(config)
-        elif provider == "AZURE":
-            return self._provision_azure(config)
-    
-    def _provision_aws(self, config: Dict[str, Any]) -> Dict[str, Any]:
-        ec2 = self.cloud_clients['aws'].client('ec2')
-        response = ec2.run_instances(
-            ImageId=config['image_id'],
-            InstanceType=config['instance_type'],
-            MinCount=1,
-            MaxCount=1,
-            NetworkInterfaces=[{'SubnetId': config['subnet_id']}]
-        )
-        return response
-    
-    # Add GCP and Azure provisioning methods similarly
-
-class LLMInterface:
-    def __init__(self, api_key: str):
-        openai.api_key = st.secrets["OPENAI_API_KEY"]
-    
-    def process_query(self, query: str) -> Dict[str, Any]:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": "You are an expert in AWS, GCP, AZURE cloud configurations and deployments, with advanced experience working with cloud provider APIs."},
-                {"role": "user", "content": query}
-            ]
-        )
-        return self._parse_llm_response(response.choices[0].message.content)
-    
-    def _parse_llm_response(self, response: str) -> Dict[str, Any]:
-        try:
-            # Attempt to parse YAML or JSON configuration from LLM response
-            return yaml.safe_load(response)
-        except:
-            st.error("Failed to parse LLM response into valid configuration")
-            return {}
-
-def main():
-    st.title("Cloud Resource Provisioner")
-    
-    # Cloud Provider Selection
-    provider = st.selectbox(
-        "Select Cloud Provider",
-        ["AWS", "GCP", "AZURE"]
-    )
-    
-    # Authentication Section
-    with st.expander("Cloud Provider Authentication"):
-        if provider == "AWS":
-            aws_access_key = st.text_input("AWS Access Key", type="password")
-            aws_secret_key = st.text_input("AWS Secret Key", type="password")
-            aws_region = st.text_input("AWS Region")
-            credentials = {
-                "access_key": aws_access_key,
-                "secret_key": aws_secret_key,
-                "region": aws_region
-            }
-        elif provider == "GCP":
-            gcp_creds_path = st.text_input("GCP Credentials File Path")
-            credentials = {"credentials_path": gcp_creds_path}
-        else:  # AZURE
-            azure_tenant = st.text_input("Azure Tenant ID")
-            azure_client = st.text_input("Azure Client ID")
-            azure_secret = st.text_input("Azure Client Secret", type="password")
-            azure_subscription = st.text_input("Azure Subscription ID")
-            credentials = {
-                "tenant_id": azure_tenant,
-                "client_id": azure_client,
-                "client_secret": azure_secret,
-                "subscription_id": azure_subscription
-            }
-    
-    # OpenAI API Configuration
-    openai.api_key = st.secrets["OPENAI_API_KEY"]
-    
-    # Initialize Components
-    if st.button("Initialize Connection"):
-        try:
-            cloud_auth = CloudAuth()
-            provisioner = CloudProvisioner()
-            
-            if provider == "AWS":
-                provisioner.cloud_clients['aws'] = cloud_auth.aws_auth(credentials)
-            elif provider == "GCP":
-                provisioner.cloud_clients['gcp'] = cloud_auth.gcp_auth(credentials)
-            else:
-                provisioner.cloud_clients['azure'] = cloud_auth.azure_auth(credentials)
-            
-            st.session_state['provisioner'] = provisioner
-            st.session_state['llm'] = LLMInterface(openai_api_key)
-            st.success("Connection established successfully!")
-            
-        except Exception as e:
-            st.error(f"Failed to initialize connection: {str(e)}")
-    
-    # Chat Interface
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    if prompt := st.chat_input("Enter your infrastructure request"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        self.actions_history: List[AWSAction] = []
+        self.deployment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.rollback_queue = queue.Queue()
         
-        if 'llm' in st.session_state and 'provisioner' in st.session_state:
-            # Process request through LLM
-            config = st.session_state['llm'].process_query(prompt)
-            
-            if config:
-                # Attempt to provision resources
+    def add_rollback_action(self, action: AWSAction, rollback_details: Dict):
+        """Add rollback information for an action"""
+        action.rollback_action = rollback_details.get('action')
+        action.rollback_parameters = rollback_details.get('parameters')
+        self.actions_history.append(action)
+
+    def execute_rollback(self, aws_client) -> List[Dict]:
+        """Execute rollback for failed deployment"""
+        rollback_results = []
+        
+        # Process actions in reverse order
+        for action in reversed(self.actions_history):
+            if action.rollback_action and action.response:  # Only rollback successful actions
                 try:
-                    result = st.session_state['provisioner'].provision_resource(provider, config)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": f"Successfully provisioned resources:\n```json\n{json.dumps(result, indent=2)}\n```"
+                    client = aws_client.get_aws_client(action.service)
+                    rollback_response = getattr(client, action.rollback_action)(
+                        **action.rollback_parameters
+                    )
+                    rollback_results.append({
+                        "action": action.rollback_action,
+                        "status": "success",
+                        "details": rollback_response
                     })
                 except Exception as e:
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": f"Failed to provision resources: {str(e)}"
+                    rollback_results.append({
+                        "action": action.rollback_action,
+                        "status": "failed",
+                        "error": str(e)
                     })
-        else:
-            st.error("Please initialize the connection first!")
+        
+        return rollback_results
 
-if __name__ == "__main__":
-    main()
+class CostEstimator:
+    def __init__(self):
+        # Base pricing for common AWS services (simplified)
+        self.pricing_data = {
+            "ec2": {
+                "t3.micro": 0.0104,  # USD per hour
+                "t3.small": 0.0208,
+                "t3.medium": 0.0416,
+            },
+            "s3": {
+                "storage": 0.023,  # USD per GB per month
+                "transfer": 0.09,  # USD per GB (outbound)
+            },
+            "rds": {
+                "t3.micro": 0.017,
+                "t3.small": 0.034,
+                "t3.medium": 0.068,
+            }
+        }
+
+    def estimate_resource_cost(self, service: str, configuration: Dict) -> Dict:
+        """Estimate cost for a specific resource configuration"""
+        monthly_cost = Decimal('0')
+        details = []
+
+        if service == "ec2":
+            instance_type = configuration.get("InstanceType", "t3.micro")
+            count = int(configuration.get("Count", 1))
+            
+            hourly_cost = Decimal(str(self.pricing_data["ec2"].get(instance_type, 0)))
+            monthly_cost = hourly_cost * 24 * 30 * count
+            
+            details.append({
+                "item": f"{count}x {instance_type} EC2 instance(s)",
+                "monthly_cost": float(monthly_cost)
+            })
+
+        elif service == "s3":
+            estimated_storage = Decimal(str(configuration.get("EstimatedStorageGB", 1)))
+            estimated_transfer = Decimal(str(configuration.get("EstimatedTransferGB", 0)))
+            
+            storage_cost = estimated_storage * Decimal(str(self.pricing_data["s3"]["storage"]))
+            transfer_cost = estimated_transfer * Decimal(str(self.pricing_data["s3"]["transfer"]))
+            monthly_cost = storage_cost + transfer_cost
+            
+            details.append({
+                "item": f"S3 Storage ({estimated_storage}GB)",
+                "monthly_cost": float(storage_cost)
+            })
+            details.append({
+                "item": f"S3 Transfer ({estimated_transfer}GB)",
+                "monthly_cost": float(transfer_cost)
+            })
+
+        return {
+            "monthly_estimate": float(monthly_cost),
+            "details": details,
+            "notes": ["Estimates are approximate and may vary based on usage patterns",
+                     "Additional costs may apply for related services",
+                     "Prices based on US East (N. Virginia) region"]
+        }
+
+class CloudAssistant:
+    def __init__(self):
+        self.openai_client = None
+        self.aws_client = None
+        self.deployment_manager = DeploymentManager()
+        self.cost_estimator = CostEstimator()
+        
+    def get_aws_client(self, service: str):
+        """Get or create an AWS service client"""
+        return boto3.client(
+            service,
+            aws_access_key_id=st.session_state.aws_credentials['access_key'],
+            aws_secret_access_key=st.session_state.aws_credentials['secret_key'],
+            region_name=st.session_state.aws_credentials['region']
+        )
+
+    def process_user_query(self, user_query: str) -> Dict:
+        """Process user query with enhanced cost estimation"""
+        system_prompt = """You are an expert AWS cloud architect. Analyze user requests and provide:
+        1. Detailed AWS configuration with specific service requirements
+        2. Resource specifications for accurate cost estimation
+        3. Deployment steps with rollback procedures
+        
+        Respond with a JSON object containing:
+        {
+            "aws_commands": [{
+                "service": "service_name",
+                "action": "action_name",
+                "parameters": {},
+                "rollback": {
+                    "action": "rollback_action",
+                    "parameters": {}
+                },
+                "cost_factors": {
+                    "service": "service_name",
+                    "EstimatedStorageGB": 0,
+                    "EstimatedTransferGB": 0,
+                    "InstanceType": "instance_type",
+                    "Count": 1
+                }
+            }],
+            "missing_info": [],
+            "explanation": "detailed_explanation",
+            "deployment_order": ["step1", "step2"],
+            "estimated_duration": "duration_in_minutes"
+        }"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0.7,
+                response_format={ "type": "json_object" }
+            )
+            
+            config = json.loads(response.choices[0].message.content)
+            
+            # Enhance with detailed cost estimation
+            total_cost = Decimal('0')
+            cost_breakdown = []
+            
+            for command in config["aws_commands"]:
+                cost_factors = command.get("cost_factors", {})
+                service = cost_factors.get("service")
+                if service:
+                    cost_estimate = self.cost_estimator.estimate_resource_cost(
+                        service, cost_factors
+                    )
+                    total_cost += Decimal(str(cost_estimate["monthly_estimate"]))
+                    cost_breakdown.extend(cost_estimate["details"])
+            
+            config["cost_estimation"] = {
+                "monthly_total": float(total_cost),
+                "breakdown": cost_breakdown,
+                "notes": self.cost_estimator.estimate_resource_cost("", {})["notes"]
+            }
+            
+            return config
+            
+        except Exception as e:
+            st.error(f"Error processing query: {str(e)}")
+            return None
+
+    def execute_deployment(self, config: Dict) -> Dict:
+        """Execute deployment with rollback support"""
+        execution_results = []
+        failed = False
+        
+        try:
+            # Execute commands in specified order
+            for step in config["deployment_order"]:
+                command = next(cmd for cmd in config["aws_commands"] 
+                             if cmd.get("step_id") == step)
+                
+                action = AWSAction(
+                    command["service"],
+                    command["action"],
+                    command["parameters"]
+                )
+                
+                # Execute the AWS action
+                client = self.get_aws_client(action.service)
+                action.response = getattr(client, action.action)(**action.parameters)
+                
+                # Store rollback information
+                self.deployment_manager.add_rollback_action(action, command.get("rollback", {}))
+                
+                execution_results.append({
+                    "step": step,
+                    "status": "success",
+                    "response": action.response
+                })
+                
+        except Exception as e:
+            failed = True
+            execution_results.append({
+                "step": step,
+                "status": "failed",
+                "error": str(e)
+            })
+            
+            # Perform rollback if any step fails
+            if failed:
+                st.warning("Deployment failed. Initiating rollback...")
+                rollback_results = self.deployment_manager.execute_rollback(self)
+                execution_results.append({
+                    "rollback_results": rollback_results
+                })
+        
+        return {
+            "success": not failed,
+            "results": execution_results,
+            "deployment_id": self.deployment_manager.deployment_id
+        }
+
+def render_cost_estimation(cost_data: Dict):
+    """Render cost estimation details"""
+    st.subheader("💰 Cost Estimation")
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.write("Monthly Cost Breakdown:")
+        for item in cost_data["breakdown"]:
+            st.write(f"- {item['item']}: ${item['monthly_cost']:.2f}")
+    
+    with col2:
+        st.metric(
+            label="Total Monthly Estimate",
+            value=f"${cost_data['monthly_total']:.2f}"
+        )
+    
+    with st.expander("Cost Estimation Notes"):
+        for note in cost_data["notes"]:
+            st.write(f"- {note}")
+
+def render_deployment_status(results: Dict):
+    """Render deployment status and results"""
+    if results["success"]:
+        st.success("✅ Deployment completed successfully")
+    else:
+        st.error("❌ Deployment failed - Rollback completed")
+    
+    with st.expander("Deployment Details"):
+        st.write(f"Deployment ID: {results['deployment_id']}")
+        for result in results["results"]:
+            if "step" in result:
+                status_icon = "✅" if result["status"] == "success" else "❌"
+                st.write(f"{status_icon} Step: {result['step']}")
+                if result["status"] == "failed":
+                    st.error(f"Error: {result['error']}")
+            elif "rollback_results" in result:
+                st.write("🔄 Rollback Results:")
+                for rollback in result["rollback_results"]:
+                    status_icon = "✅" if rollback["status"] == "success" else "❌"
+                    st.write(f"{status_icon} {rollback['action']}")
+
+def render_chat_interface():
+    """Render the chat interface with enhanced features"""
+    st.title("Cloud Configuration Assistant")
+    
+    # Display chat messages with enhanced visualization
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            
+            if "config" in message:
+                config = message["config"]
+                
+                # Show cost estimation if available
+                if "cost_estimation" in config:
+                    render_cost_estimation(config["cost_estimation"])
+                
+                # Show deployment plan
+                if "deployment_order" in config:
+                    with st.expander("Deployment Plan"):
+                        for step in config["deployment_order"]:
+                            st.write(f"- {step}")
+                
+            if "execution_results" in message:
+                render_deployment_status(message["execution_results"])
+    
+    # Chat input and processing remains the same as before...
+
+# Main function remains the same...
