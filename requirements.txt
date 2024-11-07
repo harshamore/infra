@@ -1,3 +1,39 @@
-streamlit
-boto3
-openai==0.28
+# Core application dependencies
+streamlit>=1.31.0
+boto3>=1.34.34
+openai>=1.12.0
+
+# AWS SDK dependencies
+botocore>=1.34.34
+awscli>=1.32.34
+
+# Utility packages
+python-dotenv>=1.0.0
+requests>=2.31.0
+pyyaml>=6.0.1
+jsonschema>=4.21.1
+
+# Date/time handling
+pytz>=2024.1
+python-dateutil>=2.8.2
+
+# Numeric processing
+numpy>=1.26.3
+pandas>=2.2.0
+
+# Security
+cryptography>=42.0.2
+python-jose>=3.3.0
+
+# Error handling and logging
+sentry-sdk>=1.39.1
+python-json-logger>=2.0.7
+
+# Type checking
+typing-extensions>=4.9.0
+mypy-extensions>=1.0.0
+
+# Testing dependencies (optional)
+pytest>=8.0.0
+pytest-mock>=3.12.0
+moto>=4.2.13
