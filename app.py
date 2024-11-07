@@ -1,5 +1,5 @@
 import streamlit as st
-import boto3
+from boto3 import Session
 from botocore.exceptions import ClientError
 import openai
 from datetime import datetime
@@ -7,27 +7,40 @@ import json
 import re
 import os
 
+# Load OpenAI API key from secrets
+openai.api_key = st.secrets["OPENAI_API_KEY"]
+
 class AWSPricing:
-    def __init__(self, aws_session):
-        self.pricing_client = aws_session.client('pricing', region_name='us-east-1')
+    def __init__(self, aws_session, region):
+        self.pricing_client = aws_session.client('pricing', region_name='us-east-1')  # Pricing API is only available in us-east-1
+        self.region = region
+        # Price mapping for different regions
         self.ec2_pricing = {
-            't2.micro': 0.0116,
-            't2.small': 0.023,
-            't2.medium': 0.0464,
-            't3.micro': 0.0104,
-            't3.small': 0.0208,
-            't3.medium': 0.0416,
-            # Add more instance types as needed
+            'us-east-1': {
+                't2.micro': 0.0116,
+                't2.small': 0.023,
+                't2.medium': 0.0464,
+                't3.micro': 0.0104,
+                't3.small': 0.0208,
+                't3.medium': 0.0416,
+            },
+            'us-west-2': {
+                't2.micro': 0.0116,
+                't2.small': 0.023,
+                't2.medium': 0.0464,
+                't3.micro': 0.0104,
+                't3.small': 0.0208,
+                't3.medium': 0.0416,
+            },
+            # Add more regions as needed
         }
         
     def get_ec2_price(self, instance_type):
-        return self.ec2_pricing.get(instance_type, 0.0)
+        return self.ec2_pricing.get(self.region, {}).get(instance_type, 0.0)
     
     def calculate_cost(self, command):
-        # Basic cost calculation logic
         monthly_hours = 730  # Average hours in a month
         
-        # Parse instance type from command
         instance_type = 't2.micro'  # default
         instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
         if instance_match:
@@ -40,21 +53,19 @@ class AWSPricing:
 
 class AWSExpert:
     def __init__(self):
-        self.openai_client = None
         self.aws_session = None
         self.pricing_client = None
+        self.region = None
 
-    def initialize_openai(self, api_key):
-        openai.api_key = st.secrets.get("OPENAI_API_KEY")
-        self.openai_client = openai
-
-    def connect_aws(self, access_key, secret_key):
+    def connect_aws(self, access_key, secret_key, region):
         try:
-            self.aws_session = boto3.Session(
+            self.region = region
+            self.aws_session = Session(
                 aws_access_key_id=access_key,
-                aws_secret_access_key=secret_key
+                aws_secret_access_key=secret_key,
+                region_name=region
             )
-            self.pricing_client = AWSPricing(self.aws_session)
+            self.pricing_client = AWSPricing(self.aws_session, region)
             return True
         except Exception as e:
             st.error(f"Failed to connect to AWS: {str(e)}")
@@ -62,15 +73,19 @@ class AWSExpert:
 
     def disconnect_aws(self):
         self.aws_session = None
+        self.region = None
         st.session_state.aws_connected = False
 
     def get_gpt_response(self, user_input):
         try:
-            completion = self.openai_client.chat.completions.create(
+            # Add region context to the prompt
+            region_context = f"Current AWS region: {self.region}. "
+            completion = openai.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": """You are an AWS expert, your role will be understand natural language 
+                    {"role": "system", "content": f"""You are an AWS expert, your role will be understand natural language 
                      and convert them to AWS commands. Then execute them to provision the infrastructure in the cloud. 
+                     {region_context}
                      If any information is needed from user like name, cidr etc. you will ask the user for those details"""},
                     {"role": "user", "content": user_input}
                 ]
@@ -82,16 +97,15 @@ class AWSExpert:
 
     def execute_aws_command(self, command):
         try:
-            # Parse the command and execute corresponding AWS API calls
             if "create" in command.lower() and "ec2" in command.lower():
                 ec2_client = self.aws_session.client('ec2')
-                # Extract parameters from command
+                
                 instance_type = 't2.micro'  # default
                 instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
                 if instance_match:
                     instance_type = instance_match.group(1)
                 
-                # Get the latest Amazon Linux 2 AMI
+                # Get the latest Amazon Linux 2 AMI for the selected region
                 response = ec2_client.describe_images(
                     Filters=[
                         {'Name': 'name', 'Values': ['amzn2-ami-hvm-*-x86_64-gp2']},
@@ -132,7 +146,7 @@ def main():
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
 
-    # Sidebar for AWS credentials
+    # Sidebar for AWS credentials and region selection
     with st.sidebar:
         st.header("Configuration")
         
@@ -140,17 +154,21 @@ def main():
         aws_access_key = st.text_input("AWS Access Key", type="password")
         aws_secret_key = st.text_input("AWS Secret Key", type="password")
         
-        # OpenAI API Key
-        openai_api_key = st.text_input("OpenAI API Key", type="password")
+        # AWS Region Selection
+        aws_regions = [
+            'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
+            'eu-west-1', 'eu-west-2', 'eu-central-1',
+            'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1'
+        ]
+        selected_region = st.selectbox("AWS Region", aws_regions)
         
         if st.button("Connect"):
-            if aws_access_key and aws_secret_key and openai_api_key:
-                st.session_state.aws_expert.initialize_openai(openai_api_key)
-                if st.session_state.aws_expert.connect_aws(aws_access_key, aws_secret_key):
+            if aws_access_key and aws_secret_key:
+                if st.session_state.aws_expert.connect_aws(aws_access_key, aws_secret_key, selected_region):
                     st.session_state.aws_connected = True
-                    st.success("Connected to AWS!")
+                    st.success(f"Connected to AWS in region {selected_region}!")
             else:
-                st.error("Please provide all required credentials")
+                st.error("Please provide AWS credentials")
 
         if st.session_state.aws_connected and st.button("Disconnect"):
             st.session_state.aws_expert.disconnect_aws()
@@ -158,6 +176,9 @@ def main():
 
     # Main chat interface
     if st.session_state.aws_connected:
+        # Display current region
+        st.info(f"Currently connected to AWS region: {st.session_state.aws_expert.region}")
+        
         # Display chat history
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
@@ -193,7 +214,7 @@ def main():
                         if result:
                             st.success("Command executed successfully!")
                             if estimated_cost:
-                                st.info(f"Estimated monthly cost: ${estimated_cost:.2f}")
+                                st.info(f"Estimated monthly cost in {st.session_state.aws_expert.region}: ${estimated_cost:.2f}")
                         else:
                             st.error("Failed to execute command")
     else:
