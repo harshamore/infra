@@ -32,8 +32,8 @@ user_input = st.text_input("Enter your AWS deployment request:")
 if user_input:
     # Send input to OpenAI to interpret and respond with AWS commands
     try:
-        # Using the chat completion endpoint for chat models in the new API
-        response = openai.Chat.create(
+        # Correct use of ChatCompletion endpoint for chat models
+        response = openai.ChatCompletion.create(
             model="gpt-4-turbo",
             messages=[{"role": "user", "content": user_input}]
         )
@@ -47,7 +47,7 @@ if user_input:
             additional_details = st.text_input("Additional Details Required:", key="additional")
             if additional_details:
                 # Resend with additional details if provided
-                follow_up_response = openai.Chat.create(
+                follow_up_response = openai.ChatCompletion.create(
                     model="gpt-4-turbo",
                     messages=[
                         {"role": "user", "content": user_input},
