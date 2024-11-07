@@ -10,11 +10,190 @@ from decimal import Decimal
 import queue
 import threading
 
-# [Previous DeploymentManager and CostEstimator classes remain the same]
+class DeploymentManager:
+    def __init__(self):
+        self.actions_history: List[Dict] = []
+        self.deployment_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.rollback_queue = queue.Queue()
+    
+    def add_action(self, action: Dict):
+        self.actions_history.append(action)
+    
+    def get_rollback_actions(self) -> List[Dict]:
+        return list(reversed(self.actions_history))
+
+class CostEstimator:
+    def __init__(self):
+        self.pricing_data = {
+            "ec2": {
+                "t3.micro": 0.0104,
+                "t3.small": 0.0208,
+                "t3.medium": 0.0416
+            },
+            "s3": {
+                "storage": 0.023,
+                "transfer": 0.09
+            }
+        }
+    
+    def estimate_cost(self, service: str, config: Dict) -> Dict:
+        if service == "ec2":
+            instance_type = config.get("InstanceType", "t3.micro")
+            hours = config.get("Hours", 730)  # Default to full month
+            cost = self.pricing_data["ec2"].get(instance_type, 0) * hours
+            return {
+                "monthly_cost": cost,
+                "details": f"{instance_type} running {hours} hours"
+            }
+        elif service == "s3":
+            storage_gb = config.get("StorageGB", 1)
+            transfer_gb = config.get("TransferGB", 0)
+            cost = (storage_gb * self.pricing_data["s3"]["storage"] +
+                   transfer_gb * self.pricing_data["s3"]["transfer"])
+            return {
+                "monthly_cost": cost,
+                "details": f"{storage_gb}GB storage, {transfer_gb}GB transfer"
+            }
+        return {"monthly_cost": 0, "details": "Unknown service"}
 
 class CloudAssistant:
-    # [Previous CloudAssistant implementation remains the same]
-    pass
+    def __init__(self):
+        self.openai_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+        if not self.openai_api_key:
+            raise ValueError("OpenAI API key not found in environment variables or Streamlit secrets")
+        
+        self.openai_client = OpenAI(api_key=self.openai_api_key)
+        self.deployment_manager = DeploymentManager()
+        self.cost_estimator = CostEstimator()
+        self.aws_credentials = None
+
+    def set_aws_credentials(self, credentials: Dict[str, str]):
+        """Set AWS credentials for the assistant"""
+        required_keys = ['access_key', 'secret_key', 'region']
+        if not all(key in credentials for key in required_keys):
+            raise ValueError("Missing required AWS credentials")
+        self.aws_credentials = credentials
+
+    def get_aws_client(self, service: str):
+        """Get AWS client for the specified service"""
+        if not self.aws_credentials:
+            raise ValueError("AWS credentials not set")
+        return boto3.client(
+            service,
+            aws_access_key_id=self.aws_credentials['access_key'],
+            aws_secret_access_key=self.aws_credentials['secret_key'],
+            region_name=self.aws_credentials['region']
+        )
+
+    def process_user_query(self, user_query: str) -> Dict:
+        """Process user query with OpenAI to generate AWS configurations"""
+        system_prompt = """You are an expert AWS cloud architect. When a user requests to create AWS resources:
+        1. First, explain what you'll do in a brief paragraph.
+        2. Then, list the exact AWS commands needed in this format:
+        
+        Commands:
+        Service: [service name, e.g., ec2]
+        Action: [API action, e.g., run_instances]
+        Parameters:
+        - ParameterName: value
+        - ParameterName: value
+        
+        For example, for an Ubuntu EC2 instance:
+        Commands:
+        Service: ec2
+        Action: run_instances
+        Parameters:
+        - ImageId: ami-0aa2b7722dc1b5612
+        - InstanceType: t2.micro
+        - MinCount: 1
+        - MaxCount: 1
+        - KeyName: my-key-pair"""
+
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0.7
+            )
+            
+            # Get the response text
+            response_text = response.choices[0].message.content
+            
+            # Parse the response into explanation and commands
+            parts = response_text.split("Commands:")
+            explanation = parts[0].strip()
+            
+            # Parse commands if they exist
+            commands = []
+            if len(parts) > 1:
+                command_text = parts[1].strip()
+                
+                # Split into command blocks
+                command_blocks = command_text.split("Service:")
+                
+                for block in command_blocks:
+                    if not block.strip():
+                        continue
+                        
+                    lines = block.strip().split('\n')
+                    command = {"service": "", "action": "", "parameters": {}}
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if line.startswith("Service:"):
+                            command["service"] = line.split("Service:")[1].strip().lower()
+                        elif line.startswith("Action:"):
+                            command["action"] = line.split("Action:")[1].strip()
+                        elif line.startswith("Parameters:"):
+                            continue
+                        elif line.startswith("-"):
+                            param_line = line[1:].strip()
+                            if ":" in param_line:
+                                key, value = param_line.split(":", 1)
+                                command["parameters"][key.strip()] = value.strip()
+                    
+                    if command["service"] and command["action"]:
+                        commands.append(command)
+            
+            # Create config dictionary
+            config = {
+                "explanation": explanation,
+                "aws_commands": commands,
+                "total_estimated_cost": 0
+            }
+            
+            # Add cost estimation
+            total_cost = 0
+            for command in config["aws_commands"]:
+                service = command.get("service")
+                if service:
+                    cost_estimate = self.cost_estimator.estimate_cost(
+                        service,
+                        command.get("parameters", {})
+                    )
+                    command["estimated_cost"] = cost_estimate
+                    total_cost += cost_estimate["monthly_cost"]
+            
+            config["total_estimated_cost"] = total_cost
+            return config
+            
+        except Exception as e:
+            st.error(f"Error processing query: {str(e)}")
+            return None
+
+    def execute_aws_command(self, command: Dict) -> Dict:
+        """Execute AWS command and return results"""
+        try:
+            client = self.get_aws_client(command["service"])
+            response = getattr(client, command["action"])(
+                **command["parameters"]
+            )
+            return {"success": True, "response": response}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
 def init_session_state():
     """Initialize session state variables"""
