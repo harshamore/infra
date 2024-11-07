@@ -3,7 +3,7 @@ import boto3
 import openai
 
 # Access OpenAI API key from Streamlit secrets
-openai.api_key = st.secrets["openai"]["api_key"]
+openai.api_key = st.secrets["OPENAI_API_KEY"]
 
 # Sidebar for AWS credentials
 st.sidebar.title("AWS Connection")
