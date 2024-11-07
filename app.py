@@ -10,7 +10,6 @@ from decimal import Decimal
 import queue
 import threading
 
-# Define DeploymentManager class
 class DeploymentManager:
     def __init__(self):
         self.actions_history: List[Dict] = []
@@ -23,7 +22,6 @@ class DeploymentManager:
     def get_rollback_actions(self) -> List[Dict]:
         return list(reversed(self.actions_history))
 
-# Define CostEstimator class
 class CostEstimator:
     def __init__(self):
         self.pricing_data = {
@@ -58,10 +56,8 @@ class CostEstimator:
             }
         return {"monthly_cost": 0, "details": "Unknown service"}
 
-# Define main CloudAssistant class
 class CloudAssistant:
     def __init__(self):
-        # Initialize OpenAI client with API key
         self.openai_api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
         if not self.openai_api_key:
             raise ValueError("OpenAI API key not found in environment variables or Streamlit secrets")
@@ -86,12 +82,28 @@ class CloudAssistant:
 
     def process_user_query(self, user_query: str) -> Dict:
         """Process user query with OpenAI to generate AWS configurations"""
-        system_prompt = """You are an expert AWS cloud architect. Analyze user requests and provide:
-        1. Detailed AWS configuration with specific service requirements
-        2. Resource specifications for accurate cost estimation
-        3. Deployment steps with rollback procedures
+        system_prompt = """You are an expert AWS cloud architect. Help users deploy AWS resources by following these steps:
+        1. Understand the user's requirements
+        2. Generate specific AWS configurations
+        3. Convert configurations to AWS API commands
         
-        For each AWS service mentioned, provide the exact API calls needed."""
+        Format your response as follows:
+        1. First provide a brief explanation of what you'll do
+        2. Then include a JSON block with the following structure:
+        {
+            "aws_commands": [
+                {
+                    "service": "service_name",
+                    "action": "api_action_name",
+                    "parameters": {
+                        "param1": "value1",
+                        "param2": "value2"
+                    }
+                }
+            ]
+        }
+        
+        For an EC2 instance, include: instance type, AMI ID, security group settings, and any other relevant parameters."""
 
         try:
             response = self.openai_client.chat.completions.create(
@@ -100,11 +112,20 @@ class CloudAssistant:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_query}
                 ],
-                temperature=0.7,
-                response_format={"type": "json_object"}
+                temperature=0.7
             )
             
-            config = json.loads(response.choices[0].message.content)
+            # Extract the JSON part from the response
+            response_text = response.choices[0].message.content
+            
+            # Find the JSON block in the response
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            
+            if json_start == -1 or json_end == -1:
+                raise ValueError("No valid JSON configuration found in the response")
+            
+            config = json.loads(response_text[json_start:json_end])
             
             # Add cost estimation
             total_cost = 0
@@ -119,6 +140,7 @@ class CloudAssistant:
                     total_cost += cost_estimate["monthly_cost"]
             
             config["total_estimated_cost"] = total_cost
+            config["explanation"] = response_text[:json_start].strip()
             return config
             
         except Exception as e:
@@ -209,7 +231,7 @@ def main():
         with st.chat_message("assistant"):
             config = st.session_state.assistant.process_user_query(prompt)
             if config:
-                response = f"I'll help you with that. Estimated monthly cost: ${config['total_estimated_cost']:.2f}"
+                response = f"{config['explanation']}\n\nEstimated monthly cost: ${config['total_estimated_cost']:.2f}"
                 st.write(response)
                 st.session_state.messages.append({
                     "role": "assistant",
