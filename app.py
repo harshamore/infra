@@ -32,10 +32,13 @@ user_input = st.text_input("Enter your AWS deployment request:")
 if user_input:
     # Send input to OpenAI to interpret and respond with AWS commands
     try:
-        # Correct use of ChatCompletion endpoint for chat models
+        # Setting the assistant as an AWS expert in configurations using commands and APIs
         response = openai.ChatCompletion.create(
             model="gpt-4-turbo",
-            messages=[{"role": "user", "content": user_input}]
+            messages=[
+                {"role": "system", "content": "You are an AWS expert specializing in configurations, using commands and APIs to assist users with AWS deployment and management."},
+                {"role": "user", "content": user_input}
+            ]
         )
         
         # Extract OpenAI response
@@ -50,6 +53,7 @@ if user_input:
                 follow_up_response = openai.ChatCompletion.create(
                     model="gpt-4-turbo",
                     messages=[
+                        {"role": "system", "content": "You are an AWS expert specializing in configurations, using commands and APIs to assist users with AWS deployment and management."},
                         {"role": "user", "content": user_input},
                         {"role": "assistant", "content": response_content},
                         {"role": "user", "content": additional_details}
