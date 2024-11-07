@@ -32,14 +32,17 @@ user_input = st.text_input("Enter your AWS deployment request:")
 if user_input:
     # Send input to OpenAI to interpret and respond with AWS commands
     try:
-        # Adjusted for the new OpenAI API syntax
-        response = openai.ChatCompletion.acreate(
+        response = openai.completions.create(
             model="gpt-4-turbo",
-            messages=[{"role": "user", "content": user_input}]
+            prompt=user_input,
+            max_tokens=150,
+            n=1,
+            stop=None,
+            temperature=0.7
         )
         
         # Extract OpenAI response
-        response_content = response.choices[0].message["content"]
+        response_content = response.choices[0].text.strip()
         st.write("Assistant:", response_content)
         
         # Check if additional information is required
@@ -47,15 +50,15 @@ if user_input:
             additional_details = st.text_input("Additional Details Required:", key="additional")
             if additional_details:
                 # Resend with additional details if provided
-                follow_up_response = openai.ChatCompletion.acreate(
+                follow_up_response = openai.completions.create(
                     model="gpt-4-turbo",
-                    messages=[
-                        {"role": "user", "content": user_input},
-                        {"role": "assistant", "content": response_content},
-                        {"role": "user", "content": additional_details}
-                    ]
+                    prompt=f"{user_input}\n{response_content}\nUser: {additional_details}",
+                    max_tokens=150,
+                    n=1,
+                    stop=None,
+                    temperature=0.7
                 )
-                follow_up_content = follow_up_response.choices[0].message["content"]
+                follow_up_content = follow_up_response.choices[0].text.strip()
                 st.write("Assistant:", follow_up_content)
                 
         # AWS Command Execution if fully configured
