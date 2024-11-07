@@ -45,7 +45,7 @@ class AWSExpert:
         self.pricing_client = None
 
     def initialize_openai(self, api_key):
-        openai.api_key = api_key
+        openai.api_key = st.secrets.get("OPENAI_API_KEY")
         self.openai_client = openai
 
     def connect_aws(self, access_key, secret_key):
