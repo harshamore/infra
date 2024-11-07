@@ -3,7 +3,7 @@ import boto3
 import openai
 
 # Access OpenAI API key from Streamlit secrets
-openai.api_key = st.secrets["OPENAI_API_KEY"]
+openai.api_key = st.secrets["openai"]["api_key"]
 
 # Sidebar for AWS credentials
 st.sidebar.title("AWS Connection")
@@ -32,13 +32,14 @@ user_input = st.text_input("Enter your AWS deployment request:")
 if user_input:
     # Send input to OpenAI to interpret and respond with AWS commands
     try:
-        openai_response = openai.ChatCompletion.create(
-            model="gpt-4-turbo",  # Use gpt-4-turbo model for efficiency; replace with "gpt-4o-mini" if available in your account
+        # Adjusted for the new OpenAI API syntax
+        response = openai.ChatCompletion.acreate(
+            model="gpt-4-turbo",
             messages=[{"role": "user", "content": user_input}]
         )
         
         # Extract OpenAI response
-        response_content = openai_response['choices'][0]['message']['content']
+        response_content = response.choices[0].message["content"]
         st.write("Assistant:", response_content)
         
         # Check if additional information is required
@@ -46,7 +47,7 @@ if user_input:
             additional_details = st.text_input("Additional Details Required:", key="additional")
             if additional_details:
                 # Resend with additional details if provided
-                follow_up_response = openai.ChatCompletion.create(
+                follow_up_response = openai.ChatCompletion.acreate(
                     model="gpt-4-turbo",
                     messages=[
                         {"role": "user", "content": user_input},
@@ -54,7 +55,7 @@ if user_input:
                         {"role": "user", "content": additional_details}
                     ]
                 )
-                follow_up_content = follow_up_response['choices'][0]['message']['content']
+                follow_up_content = follow_up_response.choices[0].message["content"]
                 st.write("Assistant:", follow_up_content)
                 
         # AWS Command Execution if fully configured
