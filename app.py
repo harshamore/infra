@@ -7,14 +7,23 @@ import json
 import re
 import os
 
+# Initialize session states if they don't exist
+if 'aws_connected' not in st.session_state:
+    st.session_state.aws_connected = False
+if 'aws_expert' not in st.session_state:
+    st.session_state.aws_expert = None
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+if 'current_region' not in st.session_state:
+    st.session_state.current_region = None
+
 # Load OpenAI API key from secrets
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 
 class AWSPricing:
     def __init__(self, aws_session, region):
-        self.pricing_client = aws_session.client('pricing', region_name='us-east-1')  # Pricing API is only available in us-east-1
+        self.pricing_client = aws_session.client('pricing', region_name='us-east-1')
         self.region = region
-        # Price mapping for different regions
         self.ec2_pricing = {
             'us-east-1': {
                 't2.micro': 0.0116,
@@ -32,30 +41,25 @@ class AWSPricing:
                 't3.small': 0.0208,
                 't3.medium': 0.0416,
             },
-            # Add more regions as needed
         }
         
     def get_ec2_price(self, instance_type):
         return self.ec2_pricing.get(self.region, {}).get(instance_type, 0.0)
     
     def calculate_cost(self, command):
-        monthly_hours = 730  # Average hours in a month
-        
-        instance_type = 't2.micro'  # default
+        monthly_hours = 730
+        instance_type = 't2.micro'
         instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
         if instance_match:
             instance_type = instance_match.group(1)
-        
         hourly_rate = self.get_ec2_price(instance_type)
-        monthly_cost = hourly_rate * monthly_hours
-        
-        return monthly_cost
+        return hourly_rate * monthly_hours
 
 class AWSExpert:
-    def __init__(self):
+    def __init__(self, region=None):
         self.aws_session = None
         self.pricing_client = None
-        self.region = None
+        self.region = region
 
     def connect_aws(self, access_key, secret_key, region):
         try:
@@ -66,6 +70,9 @@ class AWSExpert:
                 region_name=region
             )
             self.pricing_client = AWSPricing(self.aws_session, region)
+            # Test the connection
+            sts = self.aws_session.client('sts')
+            sts.get_caller_identity()
             return True
         except Exception as e:
             st.error(f"Failed to connect to AWS: {str(e)}")
@@ -74,11 +81,9 @@ class AWSExpert:
     def disconnect_aws(self):
         self.aws_session = None
         self.region = None
-        st.session_state.aws_connected = False
 
     def get_gpt_response(self, user_input):
         try:
-            # Add region context to the prompt
             region_context = f"Current AWS region: {self.region}. "
             completion = openai.chat.completions.create(
                 model="gpt-4",
@@ -100,12 +105,11 @@ class AWSExpert:
             if "create" in command.lower() and "ec2" in command.lower():
                 ec2_client = self.aws_session.client('ec2')
                 
-                instance_type = 't2.micro'  # default
+                instance_type = 't2.micro'
                 instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
                 if instance_match:
                     instance_type = instance_match.group(1)
                 
-                # Get the latest Amazon Linux 2 AMI for the selected region
                 response = ec2_client.describe_images(
                     Filters=[
                         {'Name': 'name', 'Values': ['amzn2-ami-hvm-*-x86_64-gp2']},
@@ -122,7 +126,6 @@ class AWSExpert:
                     MaxCount=1
                 )
                 return response
-            # Add more command handlers here
             return None
         except Exception as e:
             st.error(f"Failed to execute AWS command: {str(e)}")
@@ -138,15 +141,14 @@ class AWSExpert:
 def main():
     st.title("AWS Expert Assistant")
     
-    # Initialize session state
-    if 'aws_expert' not in st.session_state:
-        st.session_state.aws_expert = AWSExpert()
-    if 'aws_connected' not in st.session_state:
-        st.session_state.aws_connected = False
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
+    # AWS Regions
+    aws_regions = [
+        'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
+        'eu-west-1', 'eu-west-2', 'eu-central-1',
+        'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1'
+    ]
 
-    # Sidebar for AWS credentials and region selection
+    # Sidebar configuration
     with st.sidebar:
         st.header("Configuration")
         
@@ -154,30 +156,33 @@ def main():
         aws_access_key = st.text_input("AWS Access Key", type="password")
         aws_secret_key = st.text_input("AWS Secret Key", type="password")
         
-        # AWS Region Selection
-        aws_regions = [
-            'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
-            'eu-west-1', 'eu-west-2', 'eu-central-1',
-            'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1'
-        ]
+        # Region Selection
         selected_region = st.selectbox("AWS Region", aws_regions)
         
+        # Connect Button
         if st.button("Connect"):
             if aws_access_key and aws_secret_key:
+                # Create new AWSExpert instance
+                st.session_state.aws_expert = AWSExpert(selected_region)
                 if st.session_state.aws_expert.connect_aws(aws_access_key, aws_secret_key, selected_region):
                     st.session_state.aws_connected = True
+                    st.session_state.current_region = selected_region
                     st.success(f"Connected to AWS in region {selected_region}!")
             else:
                 st.error("Please provide AWS credentials")
 
+        # Disconnect Button
         if st.session_state.aws_connected and st.button("Disconnect"):
-            st.session_state.aws_expert.disconnect_aws()
+            if st.session_state.aws_expert:
+                st.session_state.aws_expert.disconnect_aws()
+            st.session_state.aws_connected = False
+            st.session_state.aws_expert = None
+            st.session_state.current_region = None
             st.success("Disconnected from AWS")
 
     # Main chat interface
-    if st.session_state.aws_connected:
-        # Display current region
-        st.info(f"Currently connected to AWS region: {st.session_state.aws_expert.region}")
+    if st.session_state.aws_connected and st.session_state.aws_expert:
+        st.info(f"Currently connected to AWS region: {st.session_state.current_region}")
         
         # Display chat history
         for message in st.session_state.chat_history:
@@ -202,11 +207,10 @@ def main():
                     st.write(gpt_response)
                 st.session_state.chat_history.append({"role": "assistant", "content": gpt_response})
 
-                # Extract AWS commands from GPT response
+                # Extract and execute AWS commands
                 aws_commands = re.findall(r'```(.*?)```', gpt_response, re.DOTALL)
                 
                 if aws_commands:
-                    # Execute AWS commands
                     for command in aws_commands:
                         result = st.session_state.aws_expert.execute_aws_command(command)
                         estimated_cost = st.session_state.aws_expert.estimate_costs(command)
@@ -214,7 +218,7 @@ def main():
                         if result:
                             st.success("Command executed successfully!")
                             if estimated_cost:
-                                st.info(f"Estimated monthly cost in {st.session_state.aws_expert.region}: ${estimated_cost:.2f}")
+                                st.info(f"Estimated monthly cost in {st.session_state.current_region}: ${estimated_cost:.2f}")
                         else:
                             st.error("Failed to execute command")
     else:
