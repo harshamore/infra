@@ -6,7 +6,37 @@ from datetime import datetime
 import json
 import re
 import os
-from pricing import AWSPricing  # Custom module for AWS pricing calculations
+
+class AWSPricing:
+    def __init__(self, aws_session):
+        self.pricing_client = aws_session.client('pricing', region_name='us-east-1')
+        self.ec2_pricing = {
+            't2.micro': 0.0116,
+            't2.small': 0.023,
+            't2.medium': 0.0464,
+            't3.micro': 0.0104,
+            't3.small': 0.0208,
+            't3.medium': 0.0416,
+            # Add more instance types as needed
+        }
+        
+    def get_ec2_price(self, instance_type):
+        return self.ec2_pricing.get(instance_type, 0.0)
+    
+    def calculate_cost(self, command):
+        # Basic cost calculation logic
+        monthly_hours = 730  # Average hours in a month
+        
+        # Parse instance type from command
+        instance_type = 't2.micro'  # default
+        instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
+        if instance_match:
+            instance_type = instance_match.group(1)
+        
+        hourly_rate = self.get_ec2_price(instance_type)
+        monthly_cost = hourly_rate * monthly_hours
+        
+        return monthly_cost
 
 class AWSExpert:
     def __init__(self):
@@ -15,7 +45,7 @@ class AWSExpert:
         self.pricing_client = None
 
     def initialize_openai(self, api_key):
-        openai.api_key = st.secrets.get("OPENAI_API_KEY")
+        openai.api_key = api_key
         self.openai_client = openai
 
     def connect_aws(self, access_key, secret_key):
@@ -36,7 +66,7 @@ class AWSExpert:
 
     def get_gpt_response(self, user_input):
         try:
-            completion = self.openai_client.ChatCompletion.create(
+            completion = self.openai_client.chat.completions.create(
                 model="gpt-4",
                 messages=[
                     {"role": "system", "content": """You are an AWS expert, your role will be understand natural language 
@@ -53,14 +83,27 @@ class AWSExpert:
     def execute_aws_command(self, command):
         try:
             # Parse the command and execute corresponding AWS API calls
-            # This is a simplified example - you would need to implement proper command parsing
             if "create" in command.lower() and "ec2" in command.lower():
                 ec2_client = self.aws_session.client('ec2')
-                # Execute EC2 creation command
+                # Extract parameters from command
+                instance_type = 't2.micro'  # default
+                instance_match = re.search(r'InstanceType=[\'"]([^\'"]+)[\'"]', command)
+                if instance_match:
+                    instance_type = instance_match.group(1)
+                
+                # Get the latest Amazon Linux 2 AMI
+                response = ec2_client.describe_images(
+                    Filters=[
+                        {'Name': 'name', 'Values': ['amzn2-ami-hvm-*-x86_64-gp2']},
+                        {'Name': 'state', 'Values': ['available']}
+                    ],
+                    Owners=['amazon']
+                )
+                ami_id = sorted(response['Images'], key=lambda x: x['CreationDate'], reverse=True)[0]['ImageId']
+                
                 response = ec2_client.run_instances(
-                    # Parse parameters from command
-                    ImageId='ami-12345678',
-                    InstanceType='t2.micro',
+                    ImageId=ami_id,
+                    InstanceType=instance_type,
                     MinCount=1,
                     MaxCount=1
                 )
@@ -73,8 +116,6 @@ class AWSExpert:
 
     def estimate_costs(self, command):
         try:
-            # Use pricing client to estimate costs
-            # This is a simplified example
             return self.pricing_client.calculate_cost(command)
         except Exception as e:
             st.error(f"Failed to estimate costs: {str(e)}")
@@ -141,7 +182,6 @@ def main():
                 st.session_state.chat_history.append({"role": "assistant", "content": gpt_response})
 
                 # Extract AWS commands from GPT response
-                # This is a simplified example - you would need more sophisticated parsing
                 aws_commands = re.findall(r'```(.*?)```', gpt_response, re.DOTALL)
                 
                 if aws_commands:
